@@ -44,12 +44,22 @@ class _HomePageState extends State<HomePage> {
   final destCtrl = TextEditingController();
   final mapController = MapController();
 
-  List<Polyline> lines = <Polyline>[];
+  List<Polyline> polylines = <Polyline>[];
   List<Marker> markers = <Marker>[];
   int? totalFare;
   bool loading = false;
 
   double _zoom = 12;
+
+  final List<Color> _segColors = const [
+    Colors.greenAccent,
+    Colors.orangeAccent,
+    Colors.cyanAccent,
+    Colors.purpleAccent,
+    Colors.yellowAccent,
+    Colors.pinkAccent,
+    Colors.lightBlueAccent,
+  ];
 
   void snack(String m) {
     if (!mounted) return;
@@ -57,7 +67,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   // =========================
-  // 1) GET MAIN LOCATION ID (sub_id=0)
+  // 1) Find main ID by name (sub_id=0)
   // =========================
   Future<int?> findMainId(String name) async {
     final res = await db
@@ -73,18 +83,17 @@ class _HomePageState extends State<HomePage> {
   }
 
   // =========================
-  // 2) LOAD ALL ROUTES (id-level graph)
+  // 2) Load all routes (for dijkstra)
   // =========================
-  Future<List<Map<String, dynamic>>> loadRoutes() async {
+  Future<List<Map<String, dynamic>>> loadRoutesMainGraph() async {
     final res = await db.from('Route').select('starting_id,destination_id,fare');
     return List<Map<String, dynamic>>.from(res as List);
   }
 
   // =========================
-  // 3) DIJKSTRA (minimum fare)
-  //    returns {path: [ids], cost: int}
+  // 3) Dijkstra on MAIN IDs only
   // =========================
-  Map<String, dynamic>? dijkstra(int start, int target, List<Map<String, dynamic>> routes) {
+  Map<String, dynamic>? dijkstraMain(int start, int target, List<Map<String, dynamic>> routes) {
     final graph = <int, List<Map<String, dynamic>>>{};
 
     for (final r in routes) {
@@ -151,26 +160,55 @@ class _HomePageState extends State<HomePage> {
   }
 
   // =========================
-  // 4) MAIN LAT/LNG for node (id, sub_id=0)
+  // 4) Find the exact Route row for a hop (A->B) (or reverse)
+  //     Returns: {starting_id, starting_sub, destination_id, destination_sub, fare}
   // =========================
-  Future<LatLng?> getMainLatLng(int id) async {
+  Future<Map<String, dynamic>?> findRouteRowEitherWay(int aId, int bId) async {
+    final forward = await db
+        .from('Route')
+        .select('starting_id,starting_sub,destination_id,destination_sub,fare')
+        .eq('starting_id', aId)
+        .eq('destination_id', bId)
+        .limit(1);
+
+    final fList = forward as List;
+    if (fList.isNotEmpty) return Map<String, dynamic>.from(fList.first as Map);
+
+    final reverse = await db
+        .from('Route')
+        .select('starting_id,starting_sub,destination_id,destination_sub,fare')
+        .eq('starting_id', bId)
+        .eq('destination_id', aId)
+        .limit(1);
+
+    final rList = reverse as List;
+    if (rList.isNotEmpty) return Map<String, dynamic>.from(rList.first as Map);
+
+    return null;
+  }
+
+  // =========================
+  // 5) Get exact point (id, sub_id) from location_v
+  // =========================
+  Future<LatLng?> getPoint(int id, int sub) async {
     final res = await db
         .from('location_v')
         .select('lat,lng')
         .eq('id', id)
-        .eq('sub_id', 0)
+        .eq('sub_id', sub)
         .limit(1);
 
     final list = res as List;
     if (list.isEmpty) return null;
-    final row = list.first;
 
+    final row = list.first;
     if (row['lat'] == null || row['lng'] == null) return null;
+
     return LatLng(asDouble(row['lat']), asDouble(row['lng']));
   }
 
   // =========================
-  // 5) OSRM road-following segment
+  // 6) OSRM road route between 2 points
   // =========================
   Future<List<LatLng>> fetchOSRM(LatLng a, LatLng b) async {
     final url =
@@ -185,8 +223,8 @@ class _HomePageState extends State<HomePage> {
     final routes = data['routes'];
     if (routes is! List || routes.isEmpty) return <LatLng>[a, b];
 
-    final geom = routes[0]['geometry'];
-    final coords = (geom as Map<String, dynamic>)['coordinates'];
+    final geom = routes[0]['geometry'] as Map<String, dynamic>;
+    final coords = geom['coordinates'];
     if (coords is! List) return <LatLng>[a, b];
 
     return coords
@@ -194,23 +232,40 @@ class _HomePageState extends State<HomePage> {
         .toList();
   }
 
-  final List<Color> _transferColors = const [
-    Colors.greenAccent,
-    Colors.orangeAccent,
-    Colors.purpleAccent,
-    Colors.cyanAccent,
-    Colors.yellowAccent,
-  ];
+  // =========================
+  // 7) Dotted line for terminal transfer
+  // =========================
+  List<Polyline> dashedLine(LatLng a, LatLng b,
+      {required Color color, double strokeWidth = 3, int pieces = 28}) {
+    final segs = <Polyline>[];
+    for (int i = 0; i < pieces; i++) {
+      if (i.isOdd) continue;
+      final t1 = i / pieces;
+      final t2 = (i + 1) / pieces;
 
-  Marker _buildMarker(LatLng p, Color color, String label) {
+      final p1 = LatLng(
+        a.latitude + (b.latitude - a.latitude) * t1,
+        a.longitude + (b.longitude - a.longitude) * t1,
+      );
+      final p2 = LatLng(
+        a.latitude + (b.latitude - a.latitude) * t2,
+        a.longitude + (b.longitude - a.longitude) * t2,
+      );
+
+      segs.add(Polyline(points: [p1, p2], strokeWidth: strokeWidth, color: color));
+    }
+    return segs;
+  }
+
+  Marker _marker(LatLng p, Color color, String label) {
     return Marker(
       point: p,
-      width: 48,
-      height: 48,
+      width: 54,
+      height: 54,
       child: Stack(
         alignment: Alignment.center,
         children: [
-          Icon(Icons.location_on, size: 40, color: color),
+          Icon(Icons.location_on, size: 44, color: color),
           Positioned(
             top: 6,
             child: Container(
@@ -219,10 +274,7 @@ class _HomePageState extends State<HomePage> {
                 color: Colors.black.withOpacity(0.75),
                 borderRadius: BorderRadius.circular(10),
               ),
-              child: Text(
-                label,
-                style: const TextStyle(fontSize: 10, color: Colors.white),
-              ),
+              child: Text(label, style: const TextStyle(fontSize: 10)),
             ),
           ),
         ],
@@ -230,6 +282,9 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  // =========================
+  // MAIN: Dijkstra on IDs, then exact sub points per hop, plus dotted transfers
+  // =========================
   Future<void> findMinimumFareRoute() async {
     final startName = startCtrl.text.trim();
     final destName = destCtrl.text.trim();
@@ -241,7 +296,7 @@ class _HomePageState extends State<HomePage> {
 
     setState(() {
       loading = true;
-      lines = <Polyline>[];
+      polylines = <Polyline>[];
       markers = <Marker>[];
       totalFare = null;
     });
@@ -249,68 +304,99 @@ class _HomePageState extends State<HomePage> {
     try {
       final startId = await findMainId(startName);
       final destId = await findMainId(destName);
-
       if (startId == null || destId == null) {
         snack("Location not found (check spelling).");
         return;
       }
 
-      final routes = await loadRoutes();
-      final result = dijkstra(startId, destId, routes);
-
-      if (result == null) {
+      final routes = await loadRoutesMainGraph();
+      final dj = dijkstraMain(startId, destId, routes);
+      if (dj == null) {
         snack("No path found.");
         return;
       }
 
-      final path = List<int>.from(result['path']);
-      final cost = result['cost'] as int;
+      final path = List<int>.from(dj['path']); // main ids only
+      final cost = dj['cost'] as int;
 
-      final fullRoute = <LatLng>[];
-      final hopPoints = <LatLng>[];
-
-      for (int i = 0; i < path.length; i++) {
-        final p = await getMainLatLng(path[i]);
-        if (p != null) hopPoints.add(p);
-      }
-
-      for (int i = 0; i < hopPoints.length - 1; i++) {
-        final seg = await fetchOSRM(hopPoints[i], hopPoints[i + 1]);
-        if (fullRoute.isNotEmpty && seg.isNotEmpty) {
-          fullRoute.addAll(seg.skip(1));
-        } else {
-          fullRoute.addAll(seg);
-        }
-      }
-
+      final newPolys = <Polyline>[];
       final newMarkers = <Marker>[];
-      if (hopPoints.isNotEmpty) {
-        newMarkers.add(_buildMarker(hopPoints.first, Colors.blueAccent, "START"));
+      final boundsPts = <LatLng>[];
+
+      LatLng? lastArrivalPoint; // the exact point we arrived at (for dotted transfer)
+      int segIndex = 0;
+
+      for (int i = 0; i < path.length - 1; i++) {
+        final aId = path[i];
+        final bId = path[i + 1];
+
+        // Find the route row for this hop (aId -> bId) and read sub ids
+        final row = await findRouteRowEitherWay(aId, bId);
+        if (row == null) {
+          snack("Missing Route row for hop $aId → $bId");
+          return;
+        }
+
+        final sId = asInt(row['starting_id']);
+        final sSub = asInt(row['starting_sub']);
+        final dId = asInt(row['destination_id']);
+        final dSub = asInt(row['destination_sub']);
+
+        final startExact = await getPoint(sId, sSub);
+        final destExact = await getPoint(dId, dSub);
+
+        if (startExact == null || destExact == null) {
+          snack("Missing location_v point for ($sId,$sSub) or ($dId,$dSub)");
+          return;
+        }
+
+        // If we arrived at the same terminal (same id) but at different sub,
+        // draw dotted transfer from previous arrival point to this segment's start point.
+        if (lastArrivalPoint != null) {
+          if (lastArrivalPoint != startExact) {
+            newPolys.addAll(dashedLine(lastArrivalPoint!, startExact,
+                color: Colors.white70, strokeWidth: 3, pieces: 30));
+            boundsPts.add(lastArrivalPoint!);
+            boundsPts.add(startExact);
+          }
+        } else {
+          // First segment: mark START at the startExact
+          newMarkers.add(_marker(startExact, Colors.blueAccent, "START"));
+        }
+
+        // Draw transport segment (OSRM) with unique color
+        final segColor = _segColors[segIndex % _segColors.length];
+        segIndex++;
+
+        final roadPts = await fetchOSRM(startExact, destExact);
+        newPolys.add(Polyline(points: roadPts, strokeWidth: 5, color: segColor));
+        boundsPts.addAll(roadPts);
+
+        // Mark "leave/take" points:
+        // - segment start point (where you take this transport)
+        // - segment destination point (where you leave this transport)
+        // To avoid duplicate markers, mark middle points only.
+        if (i > 0) {
+          newMarkers.add(_marker(startExact, segColor, "TAKE ${i + 1}"));
+        }
+        newMarkers.add(_marker(destExact, segColor, "LEAVE ${i + 1}"));
+
+        // update arrival point for next transfer check
+        lastArrivalPoint = destExact;
       }
 
-      for (int i = 1; i < hopPoints.length - 1; i++) {
-        final c = _transferColors[(i - 1) % _transferColors.length];
-        newMarkers.add(_buildMarker(hopPoints[i], c, "T$i"));
-      }
-
-      if (hopPoints.length >= 2) {
-        newMarkers.add(_buildMarker(hopPoints.last, Colors.redAccent, "END"));
+      // Mark END at last arrival point (destination exact)
+      if (lastArrivalPoint != null) {
+        newMarkers.add(_marker(lastArrivalPoint!, Colors.redAccent, "END"));
       }
 
       setState(() {
         totalFare = cost;
-        lines = [
-          Polyline(
-            points: fullRoute.isNotEmpty ? fullRoute : hopPoints,
-            strokeWidth: 5,
-            color: Colors.greenAccent,
-          )
-        ];
+        polylines = newPolys;
         markers = newMarkers;
       });
 
-      final boundsPts = (fullRoute.isNotEmpty ? fullRoute : hopPoints);
-      if (boundsPts.length >= 2) {
+      if (boundsPts.isNotEmpty) {
         mapController.fitCamera(
           CameraFit.bounds(
             bounds: LatLngBounds.fromPoints(boundsPts),
@@ -319,12 +405,13 @@ class _HomePageState extends State<HomePage> {
         );
       }
 
-      snack("Path: ${path.join(" → ")} | Fare: $cost");
+      snack("Main path: ${path.join(" → ")} | Fare: $cost");
     } finally {
       setState(() => loading = false);
     }
   }
 
+  // Zoom controls
   void _zoomIn() {
     _zoom = min(_zoom + 1, 19);
     final c = mapController.camera.center;
@@ -342,7 +429,7 @@ class _HomePageState extends State<HomePage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text("Deek — Minimum Fare")),
+      appBar: AppBar(title: const Text("Deek — Minimum Fare (Sub points)")),
       body: Stack(
         children: [
           FlutterMap(
@@ -360,7 +447,7 @@ class _HomePageState extends State<HomePage> {
                 subdomains: const ['a', 'b', 'c'],
                 userAgentPackageName: "com.example.deek",
               ),
-              PolylineLayer(polylines: lines),
+              PolylineLayer(polylines: polylines),
               MarkerLayer(markers: markers),
             ],
           ),
@@ -370,9 +457,9 @@ class _HomePageState extends State<HomePage> {
               padding: const EdgeInsets.all(12),
               child: Column(
                 children: [
-                  _Box(controller: startCtrl, hint: "Start location"),
+                  _Box(controller: startCtrl, hint: "Start location (name)"),
                   const SizedBox(height: 10),
-                  _Box(controller: destCtrl, hint: "Destination location"),
+                  _Box(controller: destCtrl, hint: "Destination location (name)"),
                   const SizedBox(height: 10),
                   SizedBox(
                     width: double.infinity,
@@ -386,7 +473,6 @@ class _HomePageState extends State<HomePage> {
             ),
           ),
 
-          // Zoom buttons (right center)
           Positioned(
             right: 12,
             bottom: totalFare != null ? 100 : 40,
@@ -427,11 +513,10 @@ class _HomePageState extends State<HomePage> {
     );
   }
 }
-
+//text
 class _Box extends StatelessWidget {
   final TextEditingController controller;
   final String hint;
-
   const _Box({required this.controller, required this.hint});
 
   @override
